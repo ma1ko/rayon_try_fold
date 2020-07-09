@@ -1,6 +1,8 @@
+#![cfg_attr(feature = "nightly", feature(try_trait, never_type))] // see https://users.rust-lang.org/t/add-unstable-feature-only-if-compiled-on-nightly/27886/2
 #[cfg(feature = "logs")]
 extern crate rayon_logs as rayon;
 
+mod adaptors;
 mod blocked;
 mod upper_bound;
 pub use blocked::Blocked;
@@ -11,19 +13,17 @@ mod algorithms;
 pub use algorithms::iter_sort::iter_par_sort;
 pub use algorithms::manual_merge::adaptive_slice_merge;
 pub use algorithms::slice_merge_sort::slice_par_sort;
+mod cap;
 mod composed;
 mod composed_counter;
-mod even_levels;
-mod filter;
+mod composed_size;
+mod composed_task;
 mod fold;
 mod join_context_policy;
-mod log;
 mod macro_blocks;
-mod map;
 mod merge;
 pub mod prelude;
 mod range;
-mod rayon_policy;
 mod sequential;
 mod slice;
 pub(crate) mod small_channel;

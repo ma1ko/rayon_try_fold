@@ -1,25 +1,28 @@
 use crate::adaptive::Adaptive;
+use crate::adaptors::{
+    even_levels::EvenLevels, filter::Filter, flat_map::FlatMap, map::Map, rayon_policy::Rayon,
+    size_limit::SizeLimit,
+};
+use crate::cap::Cap;
 use crate::composed::Composed;
 use crate::composed_counter::ComposedCounter;
-use crate::even_levels::EvenLevels;
-use crate::filter::Filter;
+use crate::composed_size::ComposedSize;
+use crate::composed_task::ComposedTask;
 use crate::fold::Fold;
 use crate::join_context_policy::JoinContextPolicy;
 use crate::lower_bound::LowerBound;
-use crate::map::Map;
 use crate::merge::Merge;
-use crate::rayon_policy::Rayon;
 use crate::sequential::Sequential;
 use crate::small_channel::small_channel;
 use crate::upper_bound::UpperBound;
 use crate::wrap::Wrap;
 use crate::zip::Zip;
 use crate::Try;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicIsize};
 
 #[cfg(feature = "logs")]
-use crate::log::Log;
+use crate::adaptors::log::Log;
 // Iterators have different properties
 // which allow for specialisation of some algorithms.
 //
@@ -164,7 +167,7 @@ where
     }
 }
 
-fn schedule_join<'f, P, T, OP, ID>(producer: P, reducer: &ReduceCallback<OP, ID>) -> T
+fn schedule_depjoin<'f, P, T, OP, ID>(producer: P, reducer: &ReduceCallback<OP, ID>) -> T
 where
     P: Producer<Item = T>,
     T: Send,
@@ -178,7 +181,7 @@ where
         let (left, right) = producer.divide();
         let (left_r, right_r) = rayon::join(
             || {
-                let my_result = schedule_join(left, reducer);
+                let my_result = schedule_depjoin(left, reducer);
                 let last = cleanup.swap(true, Ordering::SeqCst);
                 if last {
                     let his_result = receiver.recv().expect("receiving depjoin failed");
@@ -189,7 +192,7 @@ where
                 }
             },
             || {
-                let my_result = schedule_join(right, reducer);
+                let my_result = schedule_depjoin(right, reducer);
                 let last = cleanup.swap(true, Ordering::SeqCst);
                 if last {
                     let his_result = receiver1.recv().expect("receiving1 depjoin failed");
@@ -217,7 +220,7 @@ where
     where
         P: Producer<Item = T>,
     {
-        schedule_join(producer, &self)
+        schedule_depjoin(producer, &self)
     }
 }
 
@@ -233,7 +236,34 @@ where
         P: Producer<Item = I>,
     {
         let stop = AtomicBool::new(false);
-        schedule_join_try_reduce(producer, &self, &stop)
+        let sizes = std::iter::successors(Some(rayon::current_num_threads()), |s| {
+            Some(s.saturating_mul(2))
+        });
+        // let's get a sequential iterator of producers of increasing sizes
+        let producers = sizes.scan(Some(producer), |p, s| {
+            let remaining_producer = p.take().unwrap();
+            let (_, upper_bound) = remaining_producer.size_hint();
+            let capped_size = if let Some(bound) = upper_bound {
+                if bound == 0 {
+                    return None;
+                } else {
+                    s.min(bound)
+                }
+            } else {
+                s
+            };
+            let (left, right) = remaining_producer.divide_at(capped_size);
+            *p = Some(right);
+            Some(left)
+        });
+        try_fold(
+            &mut producers.map(|p| schedule_join_try_reduce(p, &self, &stop)),
+            (self.identity)(),
+            |previous_ok, current_result| match current_result.into_result() {
+                Ok(r) => (self.op)(previous_ok, r),
+                Err(e) => Try::from_error(e),
+            },
+        )
     }
 }
 
@@ -246,6 +276,18 @@ pub trait ParallelIterator: Sized {
     //so is there a method which is implemented for everyone but
     //where implementations differ based on power ?
     type Enumerable;
+
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        let c = ConsumerCallback(consumer);
+        self.with_producer(c)
+    }
+
+    /// Try to cap tasks to a given number.
+    /// We cannot ensure it because we cap the divisions
+    /// but the user might create tasks we have no control on.
+    fn cap(self, limit: &AtomicIsize) -> Cap<Self> {
+        Cap { base: self, limit }
+    }
     /// Use rayon's steals reducing scheduling policy.
     fn rayon(self, limit: usize) -> Rayon<Self> {
         Rayon {
@@ -271,6 +313,11 @@ pub trait ParallelIterator: Sized {
     }
     fn even_levels(self) -> EvenLevels<Self> {
         EvenLevels { base: self }
+    }
+    /// Don't allow any task of size lower than given limit
+    /// to go parallel.
+    fn size_limit(self, limit: usize) -> SizeLimit<Self> {
+        SizeLimit { base: self, limit }
     }
     /// This policy controls the division of the producer inside it.
     /// It will veto the division of a producer iff:
@@ -327,6 +374,18 @@ pub trait ParallelIterator: Sized {
         self.with_producer(reduce_cb)
     }
 
+    fn test_reduce<OP, ID>(self, identity: ID, op: OP) -> Self::Item
+    where
+        OP: Fn(Self::Item, Self::Item) -> Self::Item + Sync + Send,
+        ID: Fn() -> Self::Item + Send + Sync,
+    {
+        let consumer = ReduceConsumer {
+            op: &op,
+            identity: &identity,
+        };
+        self.drive(consumer)
+    }
+
     fn composed(self) -> Composed<Self> {
         Composed { base: self }
     }
@@ -337,6 +396,27 @@ pub trait ParallelIterator: Sized {
             counter: std::sync::atomic::AtomicU64::new(0),
             threshold,
         }
+    }
+
+    fn composed_task(self) -> ComposedTask<Self> {
+        ComposedTask {
+            base: self,
+            counter: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    fn composed_size(self, reset_counter: usize) -> ComposedSize<Self> {
+        ComposedSize {
+            base: self,
+            reset_counter,
+        }
+    }
+    fn flat_map<F, PI>(self, map_op: F) -> FlatMap<Self, F>
+    where
+        F: Fn(Self::Item) -> PI + Sync + Send,
+        PI: IntoParallelIterator,
+    {
+        FlatMap { base: self, map_op }
     }
 
     fn filter<F>(self, filter: F) -> Filter<Self, F>
@@ -588,5 +668,98 @@ impl<A: Sync + Send> FromParallelIterator<A> for Vec<A> {
         } else {
             Vec::new()
         }
+    }
+}
+
+pub trait Reducer<Result>: Sync {
+    fn identity(&self) -> Result;
+    fn reduce(&self, left: Result, right: Result) -> Result;
+}
+
+pub trait Consumer<Item>: Send + Sync + Sized + Clone {
+    type Result: Send;
+    type Reducer: Reducer<Self::Result>;
+    fn consume_producer<P>(self, producer: P) -> Self::Result
+    where
+        P: Producer<Item = Item>;
+    fn to_reducer(self) -> Self::Reducer;
+}
+
+struct ReduceConsumer<'f, OP, ID> {
+    op: &'f OP,
+    identity: &'f ID,
+}
+
+impl<'f, OP, ID> Clone for ReduceConsumer<'f, OP, ID> {
+    fn clone(&self) -> Self {
+        ReduceConsumer {
+            op: self.op,
+            identity: self.identity,
+        }
+    }
+}
+
+impl<'f, Item, OP, ID> Reducer<Item> for ReduceConsumer<'f, OP, ID>
+where
+    OP: Fn(Item, Item) -> Item + Send + Sync,
+    ID: Fn() -> Item + Send + Sync,
+{
+    fn identity(&self) -> Item {
+        (self.identity)()
+    }
+    fn reduce(&self, left: Item, right: Item) -> Item {
+        (self.op)(left, right)
+    }
+}
+
+impl<'f, Item, OP, ID> Consumer<Item> for ReduceConsumer<'f, OP, ID>
+where
+    Item: Send,
+    OP: Fn(Item, Item) -> Item + Send + Sync,
+    ID: Fn() -> Item + Send + Sync,
+{
+    type Result = Item;
+    type Reducer = Self;
+    fn consume_producer<P>(self, producer: P) -> Self::Result
+    where
+        P: Producer<Item = Item>,
+    {
+        schedule_join(producer, &self)
+    }
+    fn to_reducer(self) -> Self::Reducer {
+        self
+    }
+}
+
+struct ConsumerCallback<C>(C);
+
+impl<T, C> ProducerCallback<T> for ConsumerCallback<C>
+where
+    C: Consumer<T>,
+{
+    type Output = C::Result;
+    fn call<P>(self, producer: P) -> Self::Output
+    where
+        P: Producer<Item = T>,
+    {
+        self.0.consume_producer(producer)
+    }
+}
+
+pub(crate) fn schedule_join<P, T, R>(producer: P, reducer: &R) -> T
+where
+    P: Producer<Item = T>,
+    T: Send,
+    R: Reducer<T>,
+{
+    if producer.should_be_divided() {
+        let (left, right) = producer.divide();
+        let (left_r, right_r) = rayon::join(
+            || schedule_join(left, reducer),
+            || schedule_join(right, reducer),
+        );
+        reducer.reduce(left_r, right_r)
+    } else {
+        producer.fold(reducer.identity(), |a, b| reducer.reduce(a, b))
     }
 }
