@@ -41,7 +41,7 @@ macro_rules! implement_traits {
             }
             fn divide_at(self, index: usize) -> (Self, Self) {
                 let mid = self.start + (index as $x);
-                (self.start..mid, mid..self.end)
+                (self.start..mid.min(self.end), mid..self.end)
             }
         }
 
